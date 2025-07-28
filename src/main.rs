@@ -8,12 +8,16 @@ use libp2p::ping::Config;
 use libp2p::request_response::json;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{autonat, dcutr, identify, kad, mdns, noise, ping, relay, request_response, tcp, yamux, Multiaddr, PeerId, StreamProtocol};
+use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay, request_response, tcp, yamux, Multiaddr, PeerId, StreamProtocol};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::time::Duration;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use libp2p::gossipsub::{IdentTopic, MessageAuthenticity, Topic, TopicHash, ValidationMode};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::{io, select};
+
+const CHAT_TOPIC: &str = "chat";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageRequest {
@@ -36,10 +40,12 @@ struct ChatBehaviour {
     relay_server: relay::Behaviour,
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
+    gossipsub: gossipsub::Behaviour,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let chat_topic = IdentTopic::new(CHAT_TOPIC);
     let mdns_enabled = env::var("CHAT_MDNS_ENABLED")?.parse::<bool>()?;
     let bootstrap_peers = env::var("CHAT_BOOTSTRAP_PEERS")
         .map(|peers| peers.split(',').map(|s| s.to_string()).collect::<Vec<String>>());
@@ -66,6 +72,22 @@ async fn main() -> anyhow::Result<()> {
                 let mut kad_config = kad::Config::new(StreamProtocol::new("/awesome-chat/kad/1.0.0"));
                 kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(10)));
 
+                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(10))
+                    .validation_mode(ValidationMode::Strict)
+                    .message_id_fn(|message| {
+                        let mut hasher = DefaultHasher::new();
+                        message.data.hash(&mut hasher);
+                        message.topic.hash(&mut hasher);
+                        if let Some(peer_id) = message.source {
+                            peer_id.hash(&mut hasher);
+                        }
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+                        now.to_string().hash(&mut hasher);
+                        gossipsub::MessageId::from(hasher.finish().to_string())
+                    })
+                    .build()?;
+
                 Ok(
                     ChatBehaviour {
                         ping: ping::Behaviour::new(Config::new().with_interval(Duration::from_secs(10))),
@@ -87,6 +109,10 @@ async fn main() -> anyhow::Result<()> {
                         relay_server: relay::Behaviour::new(key_pair.public().to_peer_id(), relay::Config::default()),
                         relay_client,
                         dcutr: dcutr::Behaviour::new(key_pair.public().to_peer_id()),
+                        gossipsub: gossipsub::Behaviour::new(
+                            MessageAuthenticity::Signed(key_pair.clone()),
+                            gossipsub_config,
+                        )?,
                     }
                 )
             })?
@@ -114,8 +140,12 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or(anyhow!("No Peer ID found in address!"))?
                 .ok_or(anyhow!("Bootstrap peer address {bootstrap_peer} is wrong!"))?;
             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
     }
+
+    // subscribe to our chat room
+    swarm.behaviour_mut().gossipsub.subscribe(&chat_topic)?;
 
     let mut stdin = BufReader::new(io::stdin()).lines();
 
@@ -158,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                                 println!("Discovered {peer_id} at {addr}!");
                                 swarm.add_peer_address(peer_id, addr.clone());
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             }
                         }
                         mdns::Event::Expired(_) => {}
@@ -169,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
                             
                             for addr in info.listen_addrs {
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                 
                                 if is_relay
                                 {
@@ -187,11 +219,11 @@ async fn main() -> anyhow::Result<()> {
                         kad::Event::OutboundQueryProgressed{ .. } => {},
                         kad::Event::RoutingUpdated{peer,is_new_peer,addresses,bucket_range,old_peer  } => {
                             println!("New routing update! Peer: {peer} - {addresses:?}");
-                            addresses.iter().for_each(|addr| {
-                                if let Err(error) = swarm.dial(addr.clone()) {
-                                    println!("Error dialing address {:?}: {:?}", addr, error);
-                                }
-                            })
+                            // addresses.iter().for_each(|addr| {
+                            //     if let Err(error) = swarm.dial(addr.clone()) {
+                            //         println!("Error dialing address {:?}: {:?}", addr, error);
+                            //     }
+                            // })
                         },
                         kad::Event::UnroutablePeer{ .. } => {},
                         kad::Event::RoutablePeer{ .. } => {},
@@ -217,15 +249,26 @@ async fn main() -> anyhow::Result<()> {
                     ChatBehaviourEvent::Dcutr(event) => {
                         println!("Dcutr: {:?}", event);
                     },
+                    ChatBehaviourEvent::Gossipsub(event) => {
+                        println!("Gossipsub: {event:?}");
+                    }
                 }
                 _ => {}
             },
             Ok(Some(line)) = stdin.next_line() => {
-                let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
-                for peer_id in peers {
-                    swarm.behaviour_mut().messaging.send_request(&peer_id, MessageRequest { message: line.clone() });
-                    println!("{} {line:?}", swarm.local_peer_id());
+                match swarm.behaviour_mut().gossipsub.publish(chat_topic.clone(), line.as_bytes()) {
+                    Ok(_) => {
+                        println!("{} {line:?}", swarm.local_peer_id());
+                    }
+                    Err(error) => {
+                        println!("Error publishing to chat: {:?}", error);
+                    }
                 }
+                // let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+                // for peer_id in peers {
+                    // swarm.behaviour_mut().messaging.send_request(&peer_id, MessageRequest { message: line.clone() });
+                    // println!("{} {line:?}", swarm.local_peer_id());
+                // }
             },
         }
     }
